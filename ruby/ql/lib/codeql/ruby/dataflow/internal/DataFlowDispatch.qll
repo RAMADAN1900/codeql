@@ -113,6 +113,16 @@ class DataFlowCallable extends TDataFlowCallable {
     this instanceof TLibraryCallable and
     result instanceof EmptyLocation
   }
+
+  /** Gets a best-effort total ordering. */
+  int totalorder() {
+    this =
+      rank[result](DataFlowCallable c, string file, int startline, int startcolumn |
+        c.getLocation().hasLocationInfo(file, startline, startcolumn, _, _)
+      |
+        c order by file, startline, startcolumn
+      )
+  }
 }
 
 /**
@@ -143,6 +153,16 @@ abstract class DataFlowCall extends TDataFlowCall {
     string filepath, int startline, int startcolumn, int endline, int endcolumn
   ) {
     this.getLocation().hasLocationInfo(filepath, startline, startcolumn, endline, endcolumn)
+  }
+
+  /** Gets a best-effort total ordering. */
+  int totalorder() {
+    this =
+      rank[result](DataFlowCall c, int startline, int startcolumn |
+        c.hasLocationInfo(_, startline, startcolumn, _, _)
+      |
+        c order by startline, startcolumn
+      )
   }
 }
 
@@ -429,7 +449,20 @@ private Callable viableSourceCallableInit(RelevantCall call) { result = getIniti
 /** Holds if `call` may resolve to the returned source-code method. */
 private DataFlowCallable viableSourceCallable(DataFlowCall call) {
   result = viableSourceCallableNonInit(call) or
-  result.asCfgScope() = viableSourceCallableInit(call.asCall())
+  result.asCfgScope() = viableSourceCallableInit(call.asCall()) or
+  result = any(AdditionalCallTarget t).viableTarget(call.asCall())
+}
+
+/**
+ * A unit class for adding additional call steps.
+ *
+ * Extend this class to add additional call steps to the data flow graph.
+ */
+class AdditionalCallTarget extends Unit {
+  /**
+   * Gets a viable target for `call`.
+   */
+  abstract DataFlowCallable viableTarget(CfgNodes::ExprNodes::CallCfgNode call);
 }
 
 /** Holds if `call` may resolve to the returned summarized library method. */

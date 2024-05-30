@@ -4,11 +4,43 @@ use crate::node_types::{self, EntryKind, Field, NodeTypeMap, Storage, TypeName};
 use crate::trap;
 use std::collections::BTreeMap as Map;
 use std::collections::BTreeSet as Set;
+use std::env;
 use std::path::Path;
 
 use tree_sitter::{Language, Node, Parser, Range, Tree};
 
 pub mod simple;
+
+/// Sets the tracing level based on the environment variables
+/// `RUST_LOG` and `CODEQL_VERBOSITY` (prioritized in that order),
+/// falling back to `warn` if neither is set.
+pub fn set_tracing_level(language: &str) {
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .without_time()
+        .with_level(true)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(
+                |_| -> tracing_subscriber::EnvFilter {
+                    let verbosity = env::var("CODEQL_VERBOSITY")
+                        .map(|v| match v.to_lowercase().as_str() {
+                            "off" | "errors" => "error",
+                            "warnings" => "warn",
+                            "info" | "progress" => "info",
+                            "debug" | "progress+" => "debug",
+                            "trace" | "progress++" | "progress+++" => "trace",
+                            _ => "warn",
+                        })
+                        .unwrap_or_else(|_| "warn");
+                    tracing_subscriber::EnvFilter::new(format!(
+                        "{}_extractor={}",
+                        language, verbosity
+                    ))
+                },
+            ),
+        )
+        .init();
+}
 
 pub fn populate_file(writer: &mut trap::Writer, absolute_path: &Path) -> trap::Label {
     let (file_label, fresh) = writer.global_id(&trap::full_id_for_file(
@@ -43,7 +75,7 @@ fn populate_empty_file(writer: &mut trap::Writer) -> trap::Label {
 
 pub fn populate_empty_location(writer: &mut trap::Writer) {
     let file_label = populate_empty_file(writer);
-    global_location(
+    let loc_label = global_location(
         writer,
         file_label,
         trap::Location {
@@ -53,6 +85,7 @@ pub fn populate_empty_location(writer: &mut trap::Writer) {
             end_column: 0,
         },
     );
+    writer.add_tuple("empty_location", vec![trap::Arg::Label(loc_label)]);
 }
 
 pub fn populate_parent_folders(
@@ -150,7 +183,7 @@ fn location_label(
 
 /// Extracts the source file at `path`, which is assumed to be canonicalized.
 pub fn extract(
-    language: Language,
+    language: &Language,
     language_prefix: &str,
     schema: &NodeTypeMap,
     diagnostics_writer: &mut diagnostics::LogWriter,
@@ -209,10 +242,10 @@ struct Visitor<'a> {
     diagnostics_writer: &'a mut diagnostics::LogWriter,
     /// A trap::Writer to accumulate trap entries
     trap_writer: &'a mut trap::Writer,
-    /// A counter for top-level child nodes
-    toplevel_child_counter: usize,
-    /// Language-specific name of the AST info table
-    ast_node_info_table_name: String,
+    /// Language-specific name of the AST location table
+    ast_node_location_table_name: String,
+    /// Language-specific name of the AST parent table
+    ast_node_parent_table_name: String,
     /// Language-specific name of the tokeninfo table
     tokeninfo_table_name: String,
     /// A lookup table from type name to node types
@@ -242,8 +275,8 @@ impl<'a> Visitor<'a> {
             source,
             diagnostics_writer,
             trap_writer,
-            toplevel_child_counter: 0,
-            ast_node_info_table_name: format!("{}_ast_node_info", language_prefix),
+            ast_node_location_table_name: format!("{}_ast_node_location", language_prefix),
+            ast_node_parent_table_name: format!("{}_ast_node_parent", language_prefix),
             tokeninfo_table_name: format!("{}_tokeninfo", language_prefix),
             schema,
             stack: Vec::new(),
@@ -342,27 +375,29 @@ impl<'a> Visitor<'a> {
             })
             .unwrap();
         let mut valid = true;
-        let (parent_id, parent_index) = match self.stack.last_mut() {
+        let parent_info = match self.stack.last_mut() {
             Some(p) if !node.is_extra() => {
                 p.1 += 1;
-                (p.0, p.1 - 1)
+                Some((p.0, p.1 - 1))
             }
-            _ => {
-                self.toplevel_child_counter += 1;
-                (self.file_label, self.toplevel_child_counter - 1)
-            }
+            _ => None,
         };
         match &table.kind {
             EntryKind::Token { kind_id, .. } => {
                 self.trap_writer.add_tuple(
-                    &self.ast_node_info_table_name,
-                    vec![
-                        trap::Arg::Label(id),
-                        trap::Arg::Label(parent_id),
-                        trap::Arg::Int(parent_index),
-                        trap::Arg::Label(loc_label),
-                    ],
+                    &self.ast_node_location_table_name,
+                    vec![trap::Arg::Label(id), trap::Arg::Label(loc_label)],
                 );
+                if let Some((parent_id, parent_index)) = parent_info {
+                    self.trap_writer.add_tuple(
+                        &self.ast_node_parent_table_name,
+                        vec![
+                            trap::Arg::Label(id),
+                            trap::Arg::Label(parent_id),
+                            trap::Arg::Int(parent_index),
+                        ],
+                    );
+                };
                 self.trap_writer.add_tuple(
                     &self.tokeninfo_table_name,
                     vec![
@@ -378,14 +413,19 @@ impl<'a> Visitor<'a> {
             } => {
                 if let Some(args) = self.complex_node(&node, fields, &child_nodes, id) {
                     self.trap_writer.add_tuple(
-                        &self.ast_node_info_table_name,
-                        vec![
-                            trap::Arg::Label(id),
-                            trap::Arg::Label(parent_id),
-                            trap::Arg::Int(parent_index),
-                            trap::Arg::Label(loc_label),
-                        ],
+                        &self.ast_node_location_table_name,
+                        vec![trap::Arg::Label(id), trap::Arg::Label(loc_label)],
                     );
+                    if let Some((parent_id, parent_index)) = parent_info {
+                        self.trap_writer.add_tuple(
+                            &self.ast_node_parent_table_name,
+                            vec![
+                                trap::Arg::Label(id),
+                                trap::Arg::Label(parent_id),
+                                trap::Arg::Int(parent_index),
+                            ],
+                        );
+                    };
                     let mut all_args = vec![trap::Arg::Label(id)];
                     all_args.extend(args);
                     self.trap_writer.add_tuple(table_name, all_args);
